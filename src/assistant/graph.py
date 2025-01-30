@@ -7,8 +7,8 @@ from langchain_core.runnables import RunnableConfig
 from langchain_ollama import ChatOllama
 from langgraph.graph import START, END, StateGraph
 
-from assistant.configuration import Configuration
-from assistant.utils import deduplicate_and_format_sources, tavily_search, format_sources
+from assistant.configuration import Configuration, SearchAPI
+from assistant.utils import deduplicate_and_format_sources, searxng_search, format_sources, perplexity_search
 from assistant.state import SummaryState, SummaryStateInput, SummaryStateOutput
 from assistant.prompts import query_writer_instructions, summarizer_instructions, reflection_instructions
 
@@ -30,14 +30,30 @@ def generate_query(state: SummaryState, config: RunnableConfig):
     
     return {"search_query": query['query']}
 
-def web_research(state: SummaryState):
+def web_research(state: SummaryState, config: RunnableConfig):
     """ Gather information from the web """
     
+    # Configure 
+    configurable = Configuration.from_runnable_config(config)
+
+    # Handle both cases for search_api:
+    # 1. When selected in Studio UI -> returns a string (e.g. "searxng")
+    # 2. When using default -> returns an Enum (e.g. SearchAPI.SEARXNG)
+    if isinstance(configurable.search_api, str):
+        search_api = configurable.search_api
+    else:
+        search_api = configurable.search_api.value
+
     # Search the web
-    search_results = tavily_search(state.search_query, include_raw_content=True, max_results=1)
-    
-    # Format the sources
-    search_str = deduplicate_and_format_sources(search_results, max_tokens_per_source=1000)
+    if search_api == "searxng":
+        search_results = searxng_search(state.search_query, include_raw_content=True, max_results=1)
+        search_str = deduplicate_and_format_sources(search_results, max_tokens_per_source=1000, include_raw_content=True)
+    elif search_api == "perplexity":
+        search_results = perplexity_search(state.search_query, state.research_loop_count)
+        search_str = deduplicate_and_format_sources(search_results, max_tokens_per_source=1000, include_raw_content=False)
+    else:
+        raise ValueError(f"Unsupported search API: {configurable.search_api}")
+        
     return {"sources_gathered": [format_sources(search_results)], "research_loop_count": state.research_loop_count + 1, "web_research_results": [search_str]}
 
 def summarize_sources(state: SummaryState, config: RunnableConfig):
@@ -93,7 +109,15 @@ def reflect_on_summary(state: SummaryState, config: RunnableConfig):
     )   
     follow_up_query = json.loads(result.content)
 
-    # Overwrite the search query
+    # Get the follow-up query
+    query = follow_up_query.get('follow_up_query')
+
+    # JSON mode can fail in some cases
+    if not query:
+        # Fallback to a placeholder query
+        return {"search_query": f"Tell me more about {state.research_topic}"}
+
+    # Update search query with follow-up query
     return {"search_query": follow_up_query['follow_up_query']}
 
 def finalize_summary(state: SummaryState):
@@ -101,7 +125,7 @@ def finalize_summary(state: SummaryState):
     
     # Format all accumulated sources into a single bulleted list
     all_sources = "\n".join(source for source in state.sources_gathered)
-    state.running_summary = f"## Summary\n\n{state.running_summary}\n\n ### Sources:\n{all_sources}"
+    state.running_summary = f"## Summary\n\n{state.running_summary}\n\n### Sources:\n{all_sources}"
     return {"running_summary": state.running_summary}
 
 def route_research(state: SummaryState, config: RunnableConfig) -> Literal["finalize_summary", "web_research"]:

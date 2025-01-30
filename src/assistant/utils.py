@@ -1,19 +1,13 @@
+import os
+import requests
+from typing import Dict, Any
 from langsmith import traceable
-from tavily import TavilyClient
 
-def deduplicate_and_format_sources(search_response, max_tokens_per_source, include_raw_content=True):
+def deduplicate_and_format_sources(search_response, max_tokens_per_source, include_raw_content=False):
     """
-    Takes either a single search response or list of responses from Tavily API and formats them.
+    Takes either a single search response or list of responses from search APIs and formats them.
     Limits the raw_content to approximately max_tokens_per_source.
-    include_raw_content specifies whether to include the raw_content from Tavily in the formatted string.
-    
-    Args:
-        search_response: Either:
-            - A dict with a 'results' key containing a list of search results
-            - A list of dicts, each containing search results
-            
-    Returns:
-        str: Formatted string with deduplicated sources
+    include_raw_content specifies whether to include the raw_content in the formatted string.
     """
     # Convert input to list of results
     if isinstance(search_response, dict):
@@ -58,7 +52,7 @@ def format_sources(search_results):
     """Format search results into a bullet-point list of sources.
     
     Args:
-        search_results (dict): Tavily search response containing results
+        search_results (dict): Search response containing results
         
     Returns:
         str: Formatted string with sources and their URLs
@@ -69,23 +63,114 @@ def format_sources(search_results):
     )
 
 @traceable
-def tavily_search(query, include_raw_content=True, max_results=3):
-    """ Search the web using the Tavily API.
+def searxng_search(query, include_raw_content=True, max_results=3):
+    """Search the web using a local SearxNG instance.
     
     Args:
         query (str): The search query to execute
-        include_raw_content (bool): Whether to include the raw_content from Tavily in the formatted string
+        include_raw_content (bool): Whether to include the raw content in the formatted string
         max_results (int): Maximum number of results to return
         
     Returns:
-        dict: Tavily search response containing:
+        dict: Search response containing:
             - results (list): List of search result dictionaries, each containing:
                 - title (str): Title of the search result
                 - url (str): URL of the search result
                 - content (str): Snippet/summary of the content
-                - raw_content (str): Full content of the page if available"""
-     
-    tavily_client = TavilyClient()
-    return tavily_client.search(query, 
-                         max_results=max_results, 
-                         include_raw_content=include_raw_content)
+                - raw_content (str): Full content of the page if available
+    """
+    # Configure your local SearxNG instance URL
+    SEARXNG_URL = os.getenv('SEARXNG_URL', 'http://localhost:8080')
+    
+    # Set up the search parameters
+    params = {
+        'q': query,
+        'format': 'json',
+        'engines': 'google,bing,duckduckgo',  # Customize engines as needed
+        'language': 'en',
+        'max_results': max_results
+    }
+    
+    try:
+        response = requests.get(f"{SEARXNG_URL}/search", params=params)
+        response.raise_for_status()
+        search_results = response.json()
+        
+        # Transform SearxNG results to match the expected format
+        formatted_results = []
+        for result in search_results.get('results', [])[:max_results]:
+            formatted_result = {
+                'title': result.get('title', ''),
+                'url': result.get('url', ''),
+                'content': result.get('content', ''),
+                'raw_content': None  # SearxNG doesn't provide full content by default
+            }
+            
+            # Optionally fetch raw content if requested
+            if include_raw_content:
+                try:
+                    content_response = requests.get(formatted_result['url'], timeout=5)
+                    if content_response.status_code == 200:
+                        formatted_result['raw_content'] = content_response.text
+                except Exception as e:
+                    print(f"Failed to fetch raw content for {formatted_result['url']}: {str(e)}")
+            
+            formatted_results.append(formatted_result)
+            
+        return {'results': formatted_results}
+        
+    except requests.exceptions.RequestException as e:
+        print(f"Error searching SearxNG: {str(e)}")
+        return {'results': []}
+
+@traceable
+def perplexity_search(query: str, perplexity_search_loop_count: int) -> Dict[str, Any]:
+    """Search the web using the Perplexity API."""
+    # Perplexity search implementation remains unchanged
+    headers = {
+        "accept": "application/json",
+        "content-type": "application/json",
+        "Authorization": f"Bearer {os.getenv('PERPLEXITY_API_KEY')}"
+    }
+    
+    payload = {
+        "model": "sonar-pro",
+        "messages": [
+            {
+                "role": "system",
+                "content": "Search the web and provide factual information with sources."
+            },
+            {
+                "role": "user",
+                "content": query
+            }
+        ]
+    }
+    
+    response = requests.post(
+        "https://api.perplexity.ai/chat/completions",
+        headers=headers,
+        json=payload
+    )
+    response.raise_for_status()
+    
+    data = response.json()
+    content = data["choices"][0]["message"]["content"]
+    citations = data.get("citations", ["https://perplexity.ai"])
+    
+    results = [{
+        "title": f"Perplexity Search {perplexity_search_loop_count + 1}, Source 1",
+        "url": citations[0],
+        "content": content,
+        "raw_content": content
+    }]
+    
+    for i, citation in enumerate(citations[1:], start=2):
+        results.append({
+            "title": f"Perplexity Search {perplexity_search_loop_count + 1}, Source {i}",
+            "url": citation,
+            "content": "See above for full content",
+            "raw_content": None
+        })
+    
+    return {"results": results}
